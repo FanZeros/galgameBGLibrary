@@ -1,0 +1,1024 @@
+import express from 'express';
+import cors from 'cors';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import crypto from 'crypto';
+import dotenv from 'dotenv';
+import { exec } from 'child_process';
+
+
+// 1. Load Config
+// Priority: .env file -> Environment Vars -> Command Line Args
+dotenv.config();
+
+const getArg = (flag) => {
+    const arg = process.argv.find(a => a.startsWith(flag));
+    return arg ? arg.split('=')[1] : null;
+};
+
+// Config Variables
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.API_KEY || getArg('--key');
+const GAME_SERVER_TOKEN = process.env.GAME_SERVER_TOKEN || getArg('--token');
+
+// Setup Server
+const app = express();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DATA_DIR = path.join(__dirname, 'data');
+const HISTORY_FILE = path.join(DATA_DIR, 'node_history.json');
+const BG_LIBRARY_FILE = path.join(DATA_DIR, 'background_library.json'); // New Storage
+
+// Ensure data directory exists on startup
+await fs.mkdir(DATA_DIR, { recursive: true });
+
+// --- INIT: Ensure Library File Exists ---
+try {
+    await fs.access(BG_LIBRARY_FILE);
+} catch {
+    await fs.writeFile(BG_LIBRARY_FILE, '{}');
+    console.log(`✨ Initialized new background library: ${BG_LIBRARY_FILE}`);
+}
+
+app.use(cors());
+app.use(express.json({ limit: '50mb' })); // Increased limit to handle Base64 images from client sync
+
+// Request Logger
+app.use((req, res, next) => {
+    console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.originalUrl} from ${req.ip}`);
+    next();
+});
+
+// --- Rate Limiter (1 request per 60 seconds per IP, in-memory) ---
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const rateLimitMap = new Map(); // IP -> { count, resetTime }
+
+// Auto-clean expired entries every 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, entry] of rateLimitMap) {
+        if (now > entry.resetTime) rateLimitMap.delete(ip);
+    }
+}, 5 * 60 * 1000);
+
+const rateLimiter = (req, res, next) => {
+    const ip = req.ip;
+    const now = Date.now();
+    const entry = rateLimitMap.get(ip);
+
+    if (entry && now < entry.resetTime) {
+        const retryAfter = Math.ceil((entry.resetTime - now) / 1000);
+        console.log(`⛔ Rate limited: ${ip} (retry after ${retryAfter}s)`);
+        res.set('Retry-After', String(retryAfter));
+        return res.status(429).json({
+            error: `请求过于频繁，请在 ${retryAfter} 秒后重试。`,
+            retryAfterMs: entry.resetTime - now
+        });
+    }
+
+    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW_MS });
+    next();
+};
+
+// --- Input Validation Middleware ---
+const MAX_PLAYER_INPUT_LENGTH = 500;
+
+const validateGenerateInput = (req, res, next) => {
+    const body = req.body;
+
+    // Check required fields exist and have correct types
+    if (!body || typeof body !== 'object') {
+        return res.status(400).json({ error: 'Request body must be a JSON object.' });
+    }
+
+    const { playerInput, currentStoryContext, characters, existingBackgrounds, existingBgms } = body;
+
+    // playerInput: required, must be string, max length, strip HTML
+    if (typeof playerInput !== 'string' || playerInput.trim().length === 0) {
+        return res.status(400).json({ error: 'playerInput must be a non-empty string.' });
+    }
+    // Sanitize: strip HTML tags and limit length
+    body.playerInput = playerInput.replace(/<[^>]*>/g, '').trim().slice(0, MAX_PLAYER_INPUT_LENGTH);
+
+    // currentStoryContext: required object with id
+    if (!currentStoryContext || typeof currentStoryContext !== 'object' || !currentStoryContext.id) {
+        return res.status(400).json({ error: 'currentStoryContext must be an object with an id.' });
+    }
+
+    // characters: must be array if present
+    if (characters !== undefined && !Array.isArray(characters)) {
+        return res.status(400).json({ error: 'characters must be an array.' });
+    }
+
+    // existingBackgrounds: must be array if present
+    if (existingBackgrounds !== undefined && !Array.isArray(existingBackgrounds)) {
+        return res.status(400).json({ error: 'existingBackgrounds must be an array.' });
+    }
+
+    // existingBgms: must be array if present
+    if (existingBgms !== undefined && !Array.isArray(existingBgms)) {
+        return res.status(400).json({ error: 'existingBgms must be an array.' });
+    }
+
+    // aiGuidance: optional string, sanitize if present
+    if (body.aiGuidance && typeof body.aiGuidance === 'string') {
+        body.aiGuidance = body.aiGuidance.replace(/<[^>]*>/g, '').trim().slice(0, 1000);
+    }
+
+    next();
+};
+
+// --- Helper Functions ---
+
+// Simple write lock to prevent concurrent read-modify-write corruption
+let historyWriteLock = Promise.resolve();
+const withHistoryLock = (fn) => {
+    historyWriteLock = historyWriteLock.then(fn, fn);
+    return historyWriteLock;
+};
+
+const loadHistory = async () => {
+    try {
+        const data = await fs.readFile(HISTORY_FILE, 'utf-8');
+        return JSON.parse(data);
+    } catch (e) {
+        return {};
+    }
+};
+
+const saveHistory = async (data) => {
+    try {
+        await fs.writeFile(HISTORY_FILE, JSON.stringify(data, null, 2));
+    } catch (e) {
+        console.error("Failed to save history:", e);
+    }
+};
+
+// --- Background Library Helpers ---
+const loadBgLibrary = async () => {
+    try {
+        const data = await fs.readFile(BG_LIBRARY_FILE, 'utf-8');
+        return JSON.parse(data);
+    } catch (e) {
+        return {}; // Return empty object if file doesn't exist
+    }
+};
+
+const saveBgLibrary = async (data) => {
+    try {
+        await fs.writeFile(BG_LIBRARY_FILE, JSON.stringify(data, null, 2));
+        console.log("📚 Background Library updated on disk.");
+
+        // --- 新增自动上传逻辑 ---
+        exec('git add data/background_library.json && git commit -m "Auto-update library" && git push', (error) => {
+            if (error) {
+                console.error("Git Push Failed:", error);
+            } else {
+                console.log("🚀 Data pushed to GitHub successfully.");
+            }
+        });
+
+    } catch (e) {
+        console.error("Failed to save background library:", e);
+    }
+};
+
+const extractJSON = (str) => {
+    let firstOpen = str.indexOf('{');
+    let firstArray = str.indexOf('[');
+
+    // Determine if it's an object or array (whichever starts first)
+    if (firstOpen === -1 && firstArray === -1) return null;
+
+    let start, endChar;
+
+    // If array starts before object (or object doesn't exist), assume array
+    if (firstArray !== -1 && (firstOpen === -1 || firstArray < firstOpen)) {
+        start = firstArray;
+        endChar = ']'; // Match the correct closing bracket type
+    } else {
+        start = firstOpen;
+        endChar = '}'; // Match the correct closing bracket type
+    }
+
+    const end = str.lastIndexOf(endChar);
+
+    if (start !== -1 && end !== -1 && end > start) {
+        return str.substring(start, end + 1);
+    }
+    return null;
+};
+
+const cleanJsonString = (str) => {
+    if (!str) return "{}";
+    let cleaned = str.trim();
+
+    // 1. Remove markdown code blocks (keep content)
+    cleaned = cleaned.replace(/^```json/gm, '').replace(/^```/gm, '').replace(/```$/gm, '');
+
+    // 2. Try to extract valid JSON substring (Iterative approach for robustness)
+    let cursor = 0;
+    while (cursor < cleaned.length) {
+        const substr = cleaned.substring(cursor);
+        const extracted = extractJSON(substr);
+
+        if (!extracted) {
+            break;
+        }
+
+        // Validate if this extraction is parseable
+        try {
+            JSON.parse(extracted);
+            return extracted; // Found valid JSON!
+        } catch (e) {
+            // If invalid, move cursor past the first '{' of this attempt and try searching again
+            // This handles cases like: "**Thinking** { broken } ... { valid }"
+            const firstBrace = substr.indexOf('{');
+            if (firstBrace !== -1) {
+                cursor += firstBrace + 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Fallback: Just return the first brace extraction and hope for the best
+    const fallback = extractJSON(cleaned);
+    if (fallback) return fallback;
+
+    throw new Error(`No JSON object found. Content snippet: ${cleaned.substring(0, 100)}...`);
+};
+
+// --- Semantic Check Helper ---
+const checkSemanticMatch = async (input, historyEntries, context, characterNames, characterState, apiKey) => {
+    if (!historyEntries || historyEntries.length === 0) return -1;
+
+    // Fast path: exact string match (avoids unnecessary AI API call)
+    const exactIdx = historyEntries.findIndex(h => h.input === input);
+    if (exactIdx !== -1) {
+        console.log(`⚡ Exact match found at index ${exactIdx}: "${historyEntries[exactIdx].input}"`);
+        return exactIdx;
+    }
+
+    console.log(`🔍 Checking semantic match for: "${input}" against ${historyEntries.length} options...`);
+
+    const prompt = `
+    You are a semantic matching engine for a text adventure game.
+    
+    **CURRENT STORY CONTEXT:**
+    ${JSON.stringify(context)}
+
+    **KNOWN CHARACTERS:**
+    ${JSON.stringify(characterNames)}
+
+    **CURRENT CHARACTER STATE:**
+    ${JSON.stringify(characterState || {})}
+
+    **PLAYER INPUT:** "${input}"
+    
+    **HISTORY CANDIDATES (Input + State):**
+    ${historyEntries.map((h, i) => `${i}: Input="${h.input}" | State=${JSON.stringify(h.state || {})}`).join('\n')}
+    
+    Task: 
+    Determine if the PLAYER INPUT conveys the essentially SAME intention as any of the EXISTING CHOICES considering the story context AND Character State.
+    
+    **CRITICAL RULES:**
+    1. **Semantic Match**: The action/intention must be effectively the same.
+    2. **State Consistency (VERY IMPORTANT)**: 
+       - Even if the input is identical, check if the *Character State* (affection, mood) is compatible.
+       - A high-affection reaction (e.g. "I kiss him") might be stored. If the Current State is now low affection, this is a MISMATCH (return -1).
+       - Minor state differences (e.g. affection 50 vs 55) are accceptable matches. Large shifts (Happy vs Angry, High vs Low) are mismatches.
+    
+    - If it matches, return the index of the best match.
+    - If the input is a distinct new action OR the state is too different, return -1.
+    
+    **OUTPUT JSON ONLY:** { "matchIndex": number }
+    `;
+
+    try {
+        const response = await fetch('https://api.vectorengine.ai/v1beta/models/gemini-2.5-flash:generateContent', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: { responseMimeType: "application/json" }
+            })
+        });
+
+        if (!response.ok) {
+            console.warn("Semantic check API failed, skipping cache check.");
+            return -1;
+        }
+
+        const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+        if (text) {
+            const result = JSON.parse(cleanJsonString(text));
+            const idx = typeof result.matchIndex === 'number' ? result.matchIndex : -1;
+            if (idx !== -1) console.log(`✅ Match found! Index ${idx}: "${historyEntries[idx].input}"`);
+            else console.log(`⚪ No match found (New Action or State Mismatch). Generating new branch.`);
+            return idx;
+        }
+    } catch (e) {
+        console.error("Semantic check failed:", e);
+    }
+    return -1;
+};
+
+// --- Prompt Constants (Synced with writing.ts) ---
+const SPECIALINSTRUCTION = `
+    1. **OUTFIT SELECTION**:
+     - If a character has defined 'outfits' (e.g., 'casual', 'gym'), you MUST use the appropriate outfit prefix in the expression tag based on the scene context.
+     - Format: [charID#OUTFIT_EXPRESSION#position] position in only in [l/r/m] meaning LEFT/RIGHT/MIDDLE
+     (e.g., [char_sakura#gym_tired#m] or [char_sakura#casual_happy#r]).
+     - If the scene implies a specific setting (e.g., pool -> swimsuit, school -> uniform/default), select accordingly.
+     - If no outfit fits or default is fine, use the standard expression.
+    
+    2. **EVENT CG & BACKGROUND GENERATION**:
+       - For IMPORTANT emotional scenes, plot twists, key romantic moments, or deaths, do NOT use generic backgrounds.
+       - Instead, create a specific "Event CG" background ID (e.g. "bg_cg_kiss_scene").
+       - **DESCRIPTION RULES FOR CGs**:
+       - Provide a VIVID, ATMOSPHERIC, HIGHLY DETAILED description of the scene.
+       - **MANDATORY CHARACTERS**: If specific characters appear in the CG, you MUST start the description with their exact IDs in brackets.
+         - **USE ONLY THE EXACT IDs FROM THE CHARACTER ID REFERENCE PROVIDED IN THE PROMPT. DO NOT invent or guess IDs.**
+         - Example: "[char_sakura] Close up of Sakura crying tears of joy...".
+       - **MANDATORY BACKGROUND REFERENCE**: If a scene is a **variation** of an existing background, include the SOURCE background ID in brackets at the start.
+    
+    3. **OPTIONS (BRANCHING LOGIC)**:
+       - Every story node has an \`options\` array.
+       - Each option object: \`{ "label": "Text shown to player", "targetStoryId": "ID of next node" }\`
+       - **Linear Flow**: If you want the story to proceed automatically, leave \`options\` empty OR provide an option with empty \`targetStoryId\`.
+       - **Branching**: To create a choice, add multiple options.
+    
+    4. **CONTENT RULES**:
+       - Language: ALL IN Chinese (Simplified).
+       - Maintain character personality.
+       - **DO NOT include visual descriptions of the scene in the dialogue text.** The dialogue should be strictly what characters say or non-visual narration.
+       - **DO NOT use parenthetical labels in dialogue lines** such as （心声）, （内心）, （旁白）, （独白）, (Thinking), etc. Inner thoughts should be expressed naturally through narration or the character's expression tag, NOT through explicit labels.
+
+    5. **AI CUSTOM INPUT (INFINITE BRANCHING)**:
+       - You can enable players to type their own response instead of just choosing options.
+       - To do this, add a \`customInputConfig\` object to the story node.
+       - Format: \`"customInputConfig": { "enabled": true, "promptPlaceholder": "What do you say?", "aiGuidance": "If player gets angry, trigger fight scene." }\`
+       
+    6. **CHARACTER STATE UPDATES**:
+       - If the player's action changes a character's state (affection, mood, relationship), return an update Map in "characterUpdates".
+       - Format: "characterUpdates": { "char_id": { "affection": 10, "mood": "happy" } }
+       - Use relative values for numeric stats if possible, or sets new state.
+
+    7. **CRITICAL JSON FORMATTING**:
+       - Return ONLY valid JSON.
+       - Do not include any "Thinking" text, markdown, or commentary outside the JSON.
+`;
+
+// --- Core Logic Handler ---
+const handleGenerateRequest = async (req, res) => {
+    const startTime = Date.now();
+    try {
+        // 1. Auth Check (timing-safe comparison to prevent timing attacks)
+        const authHeader = req.headers.authorization;
+        if (GAME_SERVER_TOKEN) {
+            const expectedToken = `Bearer ${GAME_SERVER_TOKEN}`;
+            const isValid = authHeader && authHeader.length === expectedToken.length &&
+                crypto.timingSafeEqual(Buffer.from(authHeader), Buffer.from(expectedToken));
+            if (!isValid) {
+                console.log(`⛔ Unauthorized access attempt.`);
+                return res.status(401).json({ error: "Unauthorized: Invalid or missing token." });
+            }
+        }
+
+        // 2. Validate Payload
+        const {
+            playerInput,
+            currentStoryContext,
+            possibleReturnPoints,
+            characters,
+            existingBackgrounds,
+            existingBgms,
+            aiGuidance,
+            characterState // NEW
+        } = req.body;
+
+        if (!playerInput) {
+            return res.status(400).json({ error: "Missing playerInput" });
+        }
+
+        if (!API_KEY) {
+            throw new Error("Server configuration error: API_KEY is missing.");
+        }
+
+        console.log(`📝 Processing Branch: "${playerInput}" (Node: ${currentStoryContext.id})`);
+
+        // --- Semantic Cache Check ---
+        const history = await loadHistory();
+        const nodeHistory = history[currentStoryContext.id] || [];
+
+        // Extract Names for semantic check
+        const characterNames = characters ? characters.map(c => c.name) : [];
+
+        // Check if there's a match
+        const matchIndex = await checkSemanticMatch(
+            playerInput,
+            nodeHistory, // Pass full history objects (input + state)
+            currentStoryContext,
+            characterNames,
+            characterState,
+            API_KEY
+        );
+
+        if (matchIndex !== -1) {
+            const matchedEntry = nodeHistory[matchIndex];
+
+            // --- TRACKING UPDATE ---
+            matchedEntry.count = (matchedEntry.count || 1) + 1;
+            await saveHistory(history);
+            console.log(`📈 Choice count updated: ${matchedEntry.count}`);
+
+            const cachedFilePath = path.join(DATA_DIR, matchedEntry.filename);
+
+            try {
+                const cachedData = await fs.readFile(cachedFilePath, 'utf-8');
+                const parsedData = JSON.parse(cachedData);
+                console.log(`♻️ Returning cached branch from: ${matchedEntry.filename}`);
+                // Return cached result immediately (include branch meta for voting)
+                return res.json({
+                    ...parsedData.result,
+                    _branchMeta: {
+                        filename: matchedEntry.filename,
+                        storyId: currentStoryContext.id,
+                        likes: matchedEntry.votes?.likes || 0,
+                        dislikes: matchedEntry.votes?.dislikes || 0
+                    }
+                });
+            } catch (err) {
+                console.warn("Found match index but failed to load file. Cleaning stale entry and regenerating...", err);
+                // Remove the stale/broken entry so it doesn't keep matching
+                nodeHistory.splice(matchIndex, 1);
+                await saveHistory(history);
+            }
+        }
+
+        // --- BACKGROUND MANAGEMENT ---
+        // Load Server Library
+        const bgLibrary = await loadBgLibrary();
+        let bgLibDirty = false;
+
+        // Prepare AI Context: Merge Client BGs + Server Library
+        // We want to give AI access to ALL known backgrounds
+        // Note: We strip URLs for the AI prompt to save tokens
+        const contextBackgrounds = [...existingBackgrounds];
+        const clientBgIds = new Set(existingBackgrounds.map(b => b.id));
+
+        Object.values(bgLibrary).forEach(serverBg => {
+            if (!clientBgIds.has(serverBg.id)) {
+                // Add to context for AI (strip URL just in case server has it)
+                const { url, ...bgMeta } = serverBg;
+                contextBackgrounds.push(bgMeta);
+            }
+        });
+
+        // 3. Construct Prompt (Identical to writing.ts)
+        const charContext = characters.map(c => {
+            let outfitStr = "";
+            if (c.outfits) outfitStr = "Available Outfits: " + Object.keys(c.outfits).join(', ');
+
+            // Get only EXISTING expression keys (no URLs)
+            const expKeys = c.expressionKeys || [];
+            let expStr = "";
+            if (expKeys.length > 0) {
+                // Limit expressions to top 20 to save tokens
+                const truncatedExps = expKeys.slice(0, 20);
+                expStr = "Existing Expressions (Use Only These): " + truncatedExps.join(', ') + (expKeys.length > 20 ? "..." : "");
+            }
+
+            let stateStr = "";
+            if (characterState && characterState[c.id]) {
+                stateStr = "Current State: " + JSON.stringify(characterState[c.id]);
+            }
+
+            return `[ID: ${c.id}] Name: ${c.name}\nDescription: ${c.description}\n${outfitStr}\n${expStr}\n${stateStr}`;
+        }).join('\n---\n');
+
+        // OPTIMIZATION: Limit Backgrounds to save tokens
+        // Prioritize: Current BG + 49 others
+        const MAX_BGS = 500;
+        const currentBgId = currentStoryContext.backgroundId;
+        let optimizedBgs = contextBackgrounds.filter(b => b.id === currentBgId);
+        const otherBgs = contextBackgrounds.filter(b => b.id !== currentBgId).slice(0, MAX_BGS - optimizedBgs.length);
+        optimizedBgs = [...optimizedBgs, ...otherBgs];
+
+        const prompt = `
+    You are a Dungeon Master / AI Storyteller for a Visual Novel.
+    
+    **RULE:**
+    ${SPECIALINSTRUCTION}
+
+    **SITUATION:**
+    The player has entered a custom input during the story.
+    
+    **CURRENT SCENE:**
+    Node Name: ${currentStoryContext.name}
+    Background: ${currentStoryContext.backgroundId}
+    Previous Dialogue (Context):
+    ${JSON.stringify(currentStoryContext.dialogue.slice(-5))}
+    
+    **PLAYER INPUT:**
+    "${playerInput}"
+    
+    **GAME DESIGNER GUIDANCE:**
+    ${aiGuidance || "Decide if the input changes the story flow. If it deviates significantly, create a new branch. If it's minor, create a bridge scene and return to the main plot."}
+    
+    **AVAILABLE ASSETS:**
+    Characters: ${charContext}
+    **CHARACTER ID REFERENCE (Name → ID):**
+    ${characters.map(c => `[${c.name}] → ${c.id}`).join('\n    ')}
+    Backgrounds: ${JSON.stringify(optimizedBgs.map(b => ({ id: b.id, name: b.name, location: b.location })))}
+    Music (BGM): ${JSON.stringify(existingBgms.slice(0, 20).map(b => ({ id: b.id, name: b.name })))}
+    
+    **STORY CONTEXT & RETURN POINTS:**
+    Below is the outline of the current chapter. If you decide to merge back to the main plot, pick a suitable 'targetStoryId' from this list.
+    ${JSON.stringify(possibleReturnPoints.slice(0, 10))}
+    
+    **INSTRUCTIONS:**
+    1. Analyze the player's input.
+    2. **NARRATIVE DEPTH & PACING (CRITICAL):**
+       - **Do NOT rush.** Avoid "hollow" storytelling where things happen instantly without reaction.
+       - Use **"Show, Don't Tell"**. Describe the atmosphere, character's internal thoughts, and sensory details (sound, light, temperature) through dialogue and narration.
+       - Include **internal monologues** for the main character to show their psychological state.
+       - Expand the sequence: Reaction -> Analysis/Deepening Conflict -> Action -> Consequence.
+    3. Generate a substantial story branch:
+       - Create **5 to 20 linear story nodes (stories)** to fully explore this path.
+       - **Dialogue Density:** Each story node MUST contain **15-40 lines** of dialogue/narration.
+    4. **CONTINUATION & AI OPTIONS:**
+       - Do NOT force an ending ("The End") unless the player's action causes death or total departure.
+       - **The FINAL generated node MUST allow the story to continue via AI.** 
+       - You MUST set \`"customInputConfig": { "enabled": true, "promptPlaceholder": "What do you do next?", "aiGuidance": "Continue the story based on player input." }\` on the last node (or offer it as a choice).
+       - This allows the player to trigger another AI generation and keep the story going indefinitely.
+
+    5. **DECISION POINT**:
+       - **OPTION A (Merge Back):** If the input fits the narrative, have the characters react thoroughly, then guide the conversation back to the original flow.
+       - **OPTION B (New Branch/Infinite):** If the input is drastic, diverge completely. Create a new path. Use the \`customInputConfig\` on the last node to let the player continue exploring this new path.
+
+    6. 背景根据介绍需要完全匹配当前节点，没有合适的背景时，写下"newBackgrounds"。请使用中文来描述背景的描述,和此背景出现在的场景(location属性)。
+    
+    **OUTPUT FORMAT (JSON):**
+    {
+        "newStories": [
+            {
+                "id": "ch_\${Date.now()}_1",
+                "name": "Reaction Scene",
+                "backgroundId": "...", 
+                "bgmId": "...",
+				"summary": "Brief outline of what happens here...", 
+                "dialogue": ["Char: (Thinking) I didn't expect this...", "Char: [shocked] What did you just say?", "... (20+ lines) ..."],
+                "options": [
+                    { "label": "Next", "targetStoryId": "ch_\${Date.now()}_2" }
+                ]
+            },
+            ...
+            {
+                "id": "ch_\${Date.now()}_LAST",
+                "name": "Decision Scene",
+                "backgroundId": "...",
+				"bgmId": "...",
+				"summary": "Summary...",
+                "dialogue": ["..."],
+                "customInputConfig": { "enabled": true, "promptPlaceholder": "What do you do next?", "aiGuidance": "..." },
+                "options": [
+                    { "label": "Continue...", "targetStoryId": "EXISTING_ID_OR_END" } 
+                ]
+            }
+        ],
+        "newBackgrounds": [ { "id": "bg_new_1", "name": "Name", "description": "IN CHINESE", "location": "General environment tag" } ],
+        "characterUpdates": { "char_id": { "affection": 10, "mood": "happy" } },
+        "chapterTitle": "Short Title (4-8 words)"
+    }
+    `;
+
+        // 4. Call AI with Fallback Mechanism
+        // Priority: 3.0 Flash Preview -> 2.5 Flash
+        const MODELS = ["gemini-3-flash-preview", "gemini-2.5-flash"];
+        let aiRes;
+        let success = false;
+        let lastError;
+
+        for (const modelName of MODELS) {
+            try {
+                console.log(`🤖 Requesting AI Generation (Model: ${modelName})...`);
+                const apiUrl = `https://api.vectorengine.ai/v1beta/models/${modelName}:generateContent`;
+
+                // FORCE JSON via strict instructions appended at the end, in case middleware model ignores MimeType
+                const strictPrompt = prompt + "\n\nIMPORTANT: Output ONLY pure JSON. Do not use Markdown. Do not generate 'Thinking' blocks.";
+
+                console.log(`📊 Prompt Length (${modelName}): ${strictPrompt.length} chars`);
+
+                const payload = {
+                    contents: [{ parts: [{ text: strictPrompt }] }],
+                    generationConfig: {
+                        responseMimeType: "application/json",
+                        maxOutputTokens: 65536 // Large limit to prevent truncation for multi-node stories with dense dialogue
+                    }
+                };
+
+                const res = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-goog-api-key': API_KEY
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                if (res.ok) {
+                    aiRes = res;
+                    success = true;
+                    console.log(`✅ AI Generation Successful (Model: ${modelName})`);
+                    break;
+                } else {
+                    const errText = await res.text();
+                    console.warn(`⚠️ AI Model ${modelName} failed (${res.status}): ${errText}`);
+                    lastError = new Error(`AI Model ${modelName} failed (${res.status}): ${errText}`);
+                    // Continue to next model
+                }
+            } catch (e) {
+                console.error(`❌ AI Request Error (Model: ${modelName}):`, e);
+                lastError = e;
+                // Continue to next model
+            }
+        }
+
+        if (!success || !aiRes) {
+            throw lastError || new Error("All AI models failed to generate content.");
+        }
+
+        const aiData = await aiRes.json();
+
+        // Extract text from Gemini-compatible response
+        const candidate = aiData.candidates?.[0];
+
+        // Check for truncation or safety blocks
+        if (candidate?.finishReason === 'MAX_TOKENS') {
+            console.warn("⚠️ AI response was truncated due to MAX_TOKENS! Consider increasing maxOutputTokens or simplifying the prompt.");
+        } else if (candidate?.finishReason === 'SAFETY') {
+            console.warn("⚠️ AI response was blocked by safety filters.");
+        }
+
+        // Handle multi-part responses (filtering out thinking process)
+        const parts = candidate?.content?.parts || [];
+        const rawText = parts
+            .filter(p => p.thought !== true)
+            .map(p => p.text)
+            .join('');
+
+        if (!rawText) {
+            throw new Error("Empty response from AI provider" + (candidate?.finishReason ? ` (finishReason: ${candidate.finishReason})` : ''));
+        }
+
+        let jsonResult;
+        try {
+            const cleanedText = cleanJsonString(rawText);
+            jsonResult = JSON.parse(cleanedText);
+        } catch (parseError) {
+            console.error("❌ JSON Parse Failed. Raw Text Length:", rawText.length);
+            // Log the start of the text to see if it's thinking
+            console.error("❌ Raw Snippet:", rawText.substring(0, 500));
+            throw new Error(`AI returned invalid JSON: ${parseError.message}`);
+        }
+
+        // --- OUTPUT PROCESSING (Enrich Response with Stored URLs) ---
+        if (jsonResult.newBackgrounds && Array.isArray(jsonResult.newBackgrounds)) {
+            bgLibDirty = false;
+
+            jsonResult.newBackgrounds = jsonResult.newBackgrounds.map(newBg => {
+                // Try exact ID match first
+                let storedBg = bgLibrary[newBg.id];
+
+                // Fallback: partial name matching (e.g. name contains [刹那] matches 九条 刹那)
+                if (!storedBg && newBg.name) {
+                    const matchEntry = Object.values(bgLibrary).find(lib => {
+                        if (!lib.name) return false;
+                        // Check if either name contains the other (partial match)
+                        return lib.name.includes(newBg.name) || newBg.name.includes(lib.name);
+                    });
+                    if (matchEntry) {
+                        console.log(`🔗 Name-matched background: "${newBg.name}" ↔ "${matchEntry.name}" (${matchEntry.id})`);
+                        storedBg = matchEntry;
+                    }
+                }
+
+                // Case A: Known background with URL
+                if (storedBg && storedBg.url) {
+                    console.log(`🔗 Attaching existing URL to AI background: ${newBg.id} (matched: ${storedBg.id})`);
+                    return { ...newBg, url: storedBg.url };
+                }
+
+                // Case B: Truly new background (or known but no URL) -> Store definition
+                if (!storedBg) {
+                    bgLibrary[newBg.id] = newBg;
+                    bgLibDirty = true;
+                } else if (newBg.description !== storedBg.description) {
+                    // Update description if AI refined it
+                    bgLibrary[storedBg.id] = { ...storedBg, description: newBg.description };
+                    bgLibDirty = true;
+                }
+
+                return newBg;
+            });
+
+            if (bgLibDirty) await saveBgLibrary(bgLibrary);
+        }
+
+        // 5. Save to File (Persistence)
+        const createHash = (str) => crypto.createHash('sha256').update(str).digest('hex').substring(0, 12);
+
+        const shortHash = createHash(playerInput + JSON.stringify(characterState || {}));
+        const rawTitle = jsonResult.chapterTitle || playerInput.slice(0, 10);
+        const safeTitle = rawTitle.replace(/[^a-z0-9\u4e00-\u9fa5]/gi, '_').slice(0, 20);
+
+        const safeStoryId = currentStoryContext.id ? currentStoryContext.id.replace(/[^a-z0-9_\-\u4e00-\u9fa5]/gi, '_') : 'unknown_story';
+        const filename = `${safeStoryId}_${safeTitle}_${shortHash}.json`;
+        const filePath = path.join(DATA_DIR, filename);
+
+        const fileData = {
+            meta: {
+                timestamp: Date.now(),
+                date: new Date().toISOString(),
+                playerInput,
+                aiGuidance,
+                processTimeMs: Date.now() - startTime
+            },
+            requestContext: {
+                currentStory: currentStoryContext.name,
+                currentStoryId: currentStoryContext.id
+            },
+            result: jsonResult
+        };
+
+        await fs.writeFile(filePath, JSON.stringify(fileData, null, 2));
+        console.log(`💾 Branch saved to: data/${filename}`);
+
+        // --- UPDATE HISTORY INDEX (with lock to prevent concurrent write corruption) ---
+        await withHistoryLock(async () => {
+            const freshHistory = await loadHistory(); // Re-read to avoid stale data
+            if (!freshHistory[currentStoryContext.id]) {
+                freshHistory[currentStoryContext.id] = [];
+            }
+            freshHistory[currentStoryContext.id].push({
+                input: playerInput,
+                state: characterState, // Store state for future semantic matching
+                filename: filename,
+                timestamp: Date.now(),
+                count: 1 // Init Tracking
+            });
+            await saveHistory(freshHistory);
+        });
+
+        // 6. Return Response (include branch meta for voting)
+        res.json({
+            ...jsonResult,
+            _branchMeta: {
+                filename: filename,
+                storyId: currentStoryContext.id,
+                likes: 0,
+                dislikes: 0
+            }
+        });
+
+    } catch (e) {
+        console.error("❌ Server Error:", e);
+        res.status(500).json({ error: e.message || "Internal Server Error" });
+    }
+};
+
+// --- Routes ---
+
+app.get('/', (req, res) => {
+    res.send(`
+        <h1>Galgame AI Server</h1>
+        <p>Status: Running</p>
+        <p>Configured: ${API_KEY ? '✅ API Key' : '❌ API Key Missing'} | ${GAME_SERVER_TOKEN ? '✅ Token' : '⚠️ No Token (Public)'}</p>
+        <p>Archives: ${DATA_DIR}</p>
+    `);
+});
+
+// Handle both endpoints to prevent 404s on lazy configuration
+// Rate limiter + input validation applied to generate endpoints only
+app.post('/api/generate', rateLimiter, validateGenerateInput, handleGenerateRequest);
+app.post('/', rateLimiter, validateGenerateInput, handleGenerateRequest);
+
+// --- NEW: Random Branch Endpoint ---
+// Returns a random cached branch for a given storyId
+app.get('/api/random-branch', async (req, res) => {
+    try {
+        // Auth check (same as generate)
+        const authHeader = req.headers.authorization;
+        if (GAME_SERVER_TOKEN) {
+            const expectedToken = `Bearer ${GAME_SERVER_TOKEN}`;
+            const isValid = authHeader && authHeader.length === expectedToken.length &&
+                crypto.timingSafeEqual(Buffer.from(authHeader), Buffer.from(expectedToken));
+            if (!isValid) {
+                return res.status(401).json({ error: "Unauthorized" });
+            }
+        }
+
+        const storyId = req.query.storyId;
+        if (!storyId) {
+            return res.status(400).json({ error: "Missing storyId query parameter" });
+        }
+
+        const history = await loadHistory();
+        const entries = history[storyId];
+        if (!entries || entries.length === 0) {
+            return res.status(404).json({ error: "No cached branches for this story node", found: false });
+        }
+
+        // Pick random entry
+        const randomEntry = entries[Math.floor(Math.random() * entries.length)];
+        const filePath = path.join(DATA_DIR, randomEntry.filename);
+
+        try {
+            const fileContent = await fs.readFile(filePath, 'utf-8');
+            const fileData = JSON.parse(fileContent);
+
+            console.log(`🎲 Random branch served: "${randomEntry.input}" from ${randomEntry.filename}`);
+
+            res.json({
+                found: true,
+                playerInput: randomEntry.input,
+                result: fileData.result,
+                totalBranches: entries.length,
+                _branchMeta: {
+                    filename: randomEntry.filename,
+                    storyId,
+                    likes: randomEntry.votes?.likes || 0,
+                    dislikes: randomEntry.votes?.dislikes || 0
+                }
+            });
+        } catch (fileErr) {
+            console.error(`❌ Failed to read branch file: ${randomEntry.filename}`, fileErr);
+            return res.status(500).json({ error: "Branch file not found or corrupted" });
+        }
+    } catch (e) {
+        console.error("❌ Random Branch Error:", e);
+        res.status(500).json({ error: e.message || "Internal Server Error" });
+    }
+});
+
+// --- NEW: Vote Endpoint (Like/Dislike AI Branches) ---
+app.post('/api/vote', async (req, res) => {
+    try {
+        // Auth check
+        const authHeader = req.headers.authorization;
+        if (GAME_SERVER_TOKEN) {
+            const expectedToken = `Bearer ${GAME_SERVER_TOKEN}`;
+            const isValid = authHeader && authHeader.length === expectedToken.length &&
+                crypto.timingSafeEqual(Buffer.from(authHeader), Buffer.from(expectedToken));
+            if (!isValid) {
+                return res.status(401).json({ error: "Unauthorized" });
+            }
+        }
+
+        const { storyId, filename, vote, previousVote } = req.body;
+        if (!storyId || !filename || !['like', 'dislike'].includes(vote)) {
+            return res.status(400).json({ error: 'Missing or invalid parameters. Required: storyId, filename, vote (like/dislike)' });
+        }
+
+        await withHistoryLock(async () => {
+            const history = await loadHistory();
+            const nodeHistory = history[storyId];
+            if (!nodeHistory) {
+                return res.status(404).json({ error: 'Story node not found in history' });
+            }
+
+            const entryIndex = nodeHistory.findIndex(e => e.filename === filename);
+            if (entryIndex === -1) {
+                return res.status(404).json({ error: 'Branch entry not found' });
+            }
+
+            const entry = nodeHistory[entryIndex];
+
+            // Initialize vote counts if not present
+            if (!entry.votes) entry.votes = { likes: 0, dislikes: 0 };
+
+            // Undo previous vote if switching (client tells us what to undo)
+            if (previousVote === 'like') entry.votes.likes = Math.max(0, entry.votes.likes - 1);
+            if (previousVote === 'dislike') entry.votes.dislikes = Math.max(0, entry.votes.dislikes - 1);
+
+            // Apply new vote
+            if (vote === 'like') entry.votes.likes++;
+            if (vote === 'dislike') entry.votes.dislikes++;
+
+            console.log(`🗳️ Vote: ${vote} on "${entry.input}" (${filename}) | 👍${entry.votes.likes} 👎${entry.votes.dislikes}`);
+
+            // --- AUTO-REMOVAL CHECK: dislikes > likes + 10 ---
+            if (entry.votes.dislikes > entry.votes.likes + 10) {
+                console.log(`🗑️ Auto-removing low-quality branch: "${entry.input}" (👍${entry.votes.likes} 👎${entry.votes.dislikes})`);
+
+                // Remove data file
+                try {
+                    const filePath = path.join(DATA_DIR, entry.filename);
+                    await fs.unlink(filePath);
+                    console.log(`🗑️ Deleted file: ${entry.filename}`);
+                } catch (err) {
+                    console.warn(`⚠️ Could not delete file ${entry.filename}:`, err.message);
+                }
+
+                // Remove from history
+                nodeHistory.splice(entryIndex, 1);
+                await saveHistory(history);
+
+                return res.json({
+                    likes: entry.votes.likes,
+                    dislikes: entry.votes.dislikes,
+                    removed: true,
+                    message: '该剧情因差评过多已被自动移除'
+                });
+            }
+
+            await saveHistory(history);
+
+            res.json({
+                likes: entry.votes.likes,
+                dislikes: entry.votes.dislikes,
+                removed: false
+            });
+        });
+    } catch (e) {
+        console.error("❌ Vote Error:", e);
+        res.status(500).json({ error: e.message || "Internal Server Error" });
+    }
+});
+
+// --- NEW: Get Votes Endpoint ---
+app.get('/api/votes', async (req, res) => {
+    try {
+        // Auth check
+        const authHeader = req.headers.authorization;
+        if (GAME_SERVER_TOKEN) {
+            const expectedToken = `Bearer ${GAME_SERVER_TOKEN}`;
+            const isValid = authHeader && authHeader.length === expectedToken.length &&
+                crypto.timingSafeEqual(Buffer.from(authHeader), Buffer.from(expectedToken));
+            if (!isValid) {
+                return res.status(401).json({ error: "Unauthorized" });
+            }
+        }
+
+        const { storyId, filename } = req.query;
+        if (!storyId || !filename) {
+            return res.status(400).json({ error: 'Missing storyId or filename query parameter' });
+        }
+
+        const history = await loadHistory();
+        const nodeHistory = history[storyId];
+        if (!nodeHistory) {
+            return res.json({ likes: 0, dislikes: 0 });
+        }
+
+        const entry = nodeHistory.find(e => e.filename === filename);
+        if (!entry || !entry.votes) {
+            return res.json({ likes: 0, dislikes: 0 });
+        }
+
+        res.json({
+            likes: entry.votes.likes || 0,
+            dislikes: entry.votes.dislikes || 0
+        });
+    } catch (e) {
+        console.error("❌ Get Votes Error:", e);
+        res.status(500).json({ error: e.message || "Internal Server Error" });
+    }
+});
+
+// --- NEW: Handle Gemini Validation Ping ---
+// The client's validateAiConnection expects a standard Gemini endpoint to check connectivity.
+// We intercept this specific path to return "OK" so the UI doesn't show "Unavailable".
+// Using wildcard to catch any model name and action (e.g. :generateContent, :streamGenerateContent)
+app.post('/models/*', (req, res) => {
+    // console.log(`💓 Health Check / Validation Ping from ${req.ip} for ${req.originalUrl}`);
+    // Return a dummy valid Gemini response
+    res.json({
+        candidates: [{
+            content: {
+                parts: [{ text: "pong" }]
+            }
+        }]
+    });
+});
+
+
+// Start Server
+app.listen(PORT, () => {
+    console.log(`
+    =====================================================
+    🚀 Galgame AI Server running on http://localhost:${PORT}
+    -----------------------------------------------------
+    🔑 API Key Status: ${API_KEY ? '✅ Configured' : '❌ MISSING (Use API_KEY env var)'}
+    🔒 Token Status:   ${GAME_SERVER_TOKEN ? '✅ Configured' : '⚠️ Open Access (Use GAME_SERVER_TOKEN env var)'}
+    📂 Storage Path:   ${DATA_DIR}
+    -----------------------------------------------------
+    💡 Endpoint: POST /api/generate (or POST /)
+    =====================================================
+    `);
+});
