@@ -1,0 +1,35 @@
+{
+  "version": "1.0",
+  "default_language": "cmn",
+  "default_stability": 0.5,
+  "characters": {
+    "黑木扬羽": {
+      "voice_id": "xInaYmqLkyQN0luF581I",
+      "voice_name": "黑木扬羽_voice",
+      "description": "Voice Design - Young adult female in her early 20s, a voice that balances liveliness with composure. Not high-pitched and hyperactive, but not deep and threatening either — a naturally clear, mid-range female voice with a quick wit. She speaks at a brisk but controlled pace, like a sharp-minded merchant who enjoys the negotiation game. Her tone is playful and shrewd with a grounded confidence — she sounds capable and street-smart rather than cartoonishly cunning. When she laughs, it is genuine and slightly teasing, not sinister. Think of a clever, self-assured young businesswoman with a mischievous streak. Professional Chinese voice acting, natural and engaging. Studio-quality recording.",
+      "language": "cmn",
+      "stability": 0.5,
+      "created_at": "2026-03-26T03:14:15.928Z",
+      "last_used": "2026-03-26T03:14:15.928Z"
+    },
+    "九条刹那": {
+      "voice_id": "qrE0Yj2svKIHXpR6ehkg",
+      "voice_name": "九条刹那_voice",
+      "description": "Voice Design - Young adult female around 17-18 years old. Crystal-clear, clean voice with absolutely NO muddiness, NO breathiness, and NO vocal fry. The timbre is light, pure, and crisp — like a bell. She speaks in a calm, measured pace with a cool detachment. Not robotic, but naturally reserved and emotionally restrained — a kuudere archetype. Her voice has a slight coolness and dignity to it, as if she is always composed and slightly distant. Think of a quiet, intelligent girl who speaks plainly with perfect diction. Anime-style professional Chinese voice acting, every syllable is articulated clearly and sharply. Studio-quality recording with zero background noise and zero muddiness.",
+      "language": "cmn",
+      "stability": 0.5,
+      "created_at": "2026-03-26T03:14:22.762Z",
+      "last_used": "2026-03-26T06:04:28.292Z"
+    },
+    "星野莉莉丝": {
+      "voice_id": "buK5ezCk70blsiZWKOv5",
+      "voice_name": "星野莉莉丝_voice",
+      "description": "Voice Design - Young female around 18-19 years old, a voice that blends youthful freshness with a hint of mature elegance. Not overly girlish or cutesy, but clearly young — like a precocious teenager who has seen too much. Her tone carries natural confidence with tsundere sharpness, occasionally softening to reveal vulnerability. Medium pitch — neither high and bubbly nor low and sultry. Moderate pacing with natural dramatic flair, not overly theatrical. The overall impression is a clever, slightly world-weary young woman whose youth still shows through despite her attempts to appear composed. Professional Chinese voice acting, balanced and natural. Studio-quality recording.",
+      "language": "cmn",
+      "stability": 0.5,
+      "created_at": "2026-03-26T03:14:32.716Z",
+      "last_used": "2026-03-26T03:14:32.716Z"
+    }
+  },
+  "special_voices": {}
+}
